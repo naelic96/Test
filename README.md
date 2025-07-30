@@ -1,140 +1,94 @@
-import json
-import logging
 import grpc
 from concurrent import futures
-from threading import Lock
+import logging
+import json
+import time
 
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc, logs_service_pb2
 from opentelemetry.proto.logs.v1 import logs_pb2
-from opentelemetry.proto.resource.v1 import resource_pb2
+from opentelemetry.proto.common.v1 import common_pb2
+
+from opentelemetry.exporter.otlp.proto.grpc.exporter import OTLPExporterMixin  # potrebbe non esistere
+# In alternativa usa OTLP exporter class direttamente da opentelemetry-exporter-otlp-proto-grpc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enricher")
 
-ENRICH_FILE_PATH = "/tmp/enriched_tags.json"
-FORWARD_TO_ALLOY_ENDPOINT = "localhost:4317"
-LABELS_TO_PROMOTE = ["aws_region", "global_app"]  # solo queste diventano label, le altre restano campi
+ENRICH_KEYS_AS_LABELS = {"aws_region", "global_app"}
 
-class LogEnricherServicer(logs_service_pb2_grpc.LogsServiceServicer):
-    def __init__(self, enrich_file_path, labels_to_promote):
-        self.enrich_file_path = enrich_file_path
-        self.labels_to_promote = labels_to_promote
-        self.lock = Lock()
+class OTLPLogExporterCustom:
+    def __init__(self, endpoint):
+        from opentelemetry.exporter.otlp.proto.grpc.logs_exporter import OTLPLogExporter
+        self._exporter = OTLPLogExporter(endpoint=endpoint, insecure=True)
+
+    def export(self, logs_data):
+        return self._exporter.export(logs_data)
+
+class EnrichServicer(logs_service_pb2_grpc.LogsServiceServicer):
+    def __init__(self, enrich_path):
+        self.enrich_path = enrich_path
         self.enrich_data = self.load_enrich_file()
-
-        # gRPC client per inoltro a Alloy
-        self.channel = grpc.insecure_channel(FORWARD_TO_ALLOY_ENDPOINT)
-        self.client = logs_service_pb2_grpc.LogsServiceStub(self.channel)
+        self.exporter = OTLPLogExporterCustom("localhost:4317")
+        logger.info(f"Loaded enrich data for targets: {list(self.enrich_data.keys())}")
 
     def load_enrich_file(self):
         try:
-            with open(self.enrich_file_path, "r") as f:
+            with open(self.enrich_path, "r") as f:
                 data = json.load(f)
-                logger.info(f"Enrichment file caricato: {self.enrich_file_path}")
-                return data
+            return data
         except Exception as e:
-            logger.error(f"Errore durante il caricamento del file JSON: {e}")
-            return []
-
-    def match_enrich_labels(self, log_group_name):
-        # Match esatto tra log_group_name e uno dei targets nell'enrich_data
-        for entry in self.enrich_data:
-            targets = entry.get("targets", [])
-            if log_group_name in targets:
-                return entry.get("labels", {})
-        return {}
-
-    def enrich_log_record(self, log_record, enrich_labels):
-        # Enrich attributes con labels e campi, promuovendo alcune a labels
-        # log_record è LogRecord protobuf, ha attributes (repeated KeyValue)
-
-        # Convert attributes to dict
-        attr_dict = {kv.key: kv.value.string_value for kv in log_record.attributes}
-
-        # Add enrich labels as fields (campi)
-        for k, v in enrich_labels.items():
-            attr_dict[k] = v
-
-        # Ricrea la lista attributes e separa labels da campi
-        new_attributes = []
-        new_labels = {}
-
-        for k, v in attr_dict.items():
-            if k in self.labels_to_promote:
-                new_labels[k] = v
-            else:
-                new_attributes.append(logs_pb2.KeyValue(key=k, value=logs_pb2.AnyValue(string_value=v)))
-
-        # Sostituisci attributi con campi aggiornati
-        log_record.attributes[:] = new_attributes
-
-        # Le labels devono andare nel Resource attributes della ResourceLogs
-        # Lo aggiustiamo in Export()
-
-        return new_labels  # ritorna labels promosse per Resource
+            logger.error(f"Error loading enrich file: {e}")
+            return {}
 
     def Export(self, request, context):
-        logger.info(f"Ricevuta Export chiamata con {len(request.resource_logs)} ResourceLogs")
+        logger.info(f"Received Export request with {len(request.resource_logs)} resource_logs")
 
-        # Ricarica il file ogni volta (potresti mettere cache con refresh a intervalli)
-        with self.lock:
-            self.enrich_data = self.load_enrich_file()
-
-        # Itera su ResourceLogs
         for resource_log in request.resource_logs:
-            # Ottieni il log_group_name da Resource attributes
+            resource_attrs = resource_log.resource.attributes
+
             log_group_name = None
-            for attr in resource_log.resource.attributes:
-                if attr.key == "cloudwatch_log_group_name":
-                    log_group_name = attr.value.string_value
+            for k, v in resource_attrs.items():
+                if k == "cloudwatch_log_group_name":
+                    log_group_name = v.string_value
                     break
 
-            if not log_group_name:
-                logger.warning("ResourceLogs senza cloudwatch_log_group_name, salto enrich")
+            logger.info(f"log_group_name: {log_group_name}")
+
+            if not log_group_name or log_group_name not in self.enrich_data:
                 continue
 
-            logger.info(f"Log group trovato: {log_group_name}")
-
-            enrich_labels = self.match_enrich_labels(log_group_name)
-            logger.info(f"Labels trovate per enrich: {enrich_labels}")
-
-            # Enrich dei LogRecords nei ScopeLogs
-            # Inoltre costruiamo nuovi attributi Resource per le labels promosse
-            promoted_labels = {}
+            enrich_labels = self.enrich_data[log_group_name]
+            logger.info(f"Enriching logs for {log_group_name} with {enrich_labels}")
 
             for scope_log in resource_log.scope_logs:
                 for log_record in scope_log.logs:
-                    labels_from_log = self.enrich_log_record(log_record, enrich_labels)
-                    promoted_labels.update(labels_from_log)
+                    # enrich attributes with all enrich_labels as string AnyValue
+                    for key, val in enrich_labels.items():
+                        # NOTE: no 'labels' field in proto; Loki treats attributes as fields/labels
+                        log_record.attributes[key].CopyFrom(common_pb2.AnyValue(string_value=val))
 
-            # Aggiungi/aggiorna Resource attributes con labels promosse
-            # Rimuovi quelle che eventualmente esistono con lo stesso nome prima di aggiungere
-            resource_log.resource.attributes[:] = [
-                attr for attr in resource_log.resource.attributes if attr.key not in promoted_labels
-            ]
-            for k, v in promoted_labels.items():
-                resource_log.resource.attributes.append(
-                    resource_pb2.KeyValue(key=k, value=resource_pb2.AnyValue(string_value=v))
-                )
-
-        # Inoltra i logs arricchiti a Alloy collector
         try:
-            response = self.client.Export(request)
-            logger.info("Log arricchiti inoltrati a Alloy con successo")
+            self.exporter.export(request)
+            logger.info("Forwarded enriched logs to Alloy")
         except Exception as e:
-            logger.error(f"Errore invio a Alloy: {e}")
+            logger.error(f"Error forwarding logs: {e}")
 
         return logs_service_pb2.ExportLogsServiceResponse()
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     logs_service_pb2_grpc.add_LogsServiceServicer_to_server(
-        LogEnricherServicer(ENRICH_FILE_PATH, LABELS_TO_PROMOTE), server
+        EnrichServicer("/tmp/enriched_tags.json"),
+        server
     )
     server.add_insecure_port("[::]:50051")
     server.start()
-    logger.info("gRPC LogEnricher server in ascolto sulla porta 50051")
-    server.wait_for_termination()
+    logger.info("gRPC Enricher Server started on port 50051")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        server.stop(0)
 
 if __name__ == "__main__":
     serve()

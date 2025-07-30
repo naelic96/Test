@@ -1,88 +1,98 @@
 import grpc
-from concurrent import futures
-import logging
 import json
+import logging
+from concurrent import futures
 
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc, logs_service_pb2
 from opentelemetry.proto.logs.v1 import logs_pb2
 from opentelemetry.proto.resource.v1 import resource_pb2
-from opentelemetry.proto.common.v1 import common_pb2
+
+from opentelemetry.exporter.otlp.proto.grpc.logs_exporter import OTLPLogExporter
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enricher")
 
-ENRICH_FILE = "/tmp/enriched_tags.json"
-LABEL_KEYS = {"aws_region", "global_app"}
+JSON_PATH = "/tmp/enriched_tags.json"
+ALLOY_OTLP_ENDPOINT = "localhost:4317"
 
-
-def load_enrichment():
+# Carica JSON arricchimenti una volta all'avvio
+def load_enrichments():
     try:
-        with open(ENRICH_FILE, "r") as f:
+        with open(JSON_PATH, "r") as f:
             data = json.load(f)
-            return {item["targets"]: item for item in data}
+            # data è lista di dict con 'targets' (lista) e 'labels' (dict)
+            logger.info(f"Loaded enrichment rules from {JSON_PATH}")
+            return data
     except Exception as e:
-        logger.error(f"Errore durante il caricamento del file JSON: {e}")
-        return {}
+        logger.error(f"Errore caricamento file JSON: {e}")
+        return []
 
-enrichment_cache = load_enrichment()
+ENRICHMENTS = load_enrichments()
 
+# Exporter OTLP verso Alloy
+exporter = OTLPLogExporter(endpoint=ALLOY_OTLP_ENDPOINT, insecure=True)
 
-class EnricherService(logs_service_pb2_grpc.LogsServiceServicer):
+class LogEnricherServicer(logs_service_pb2_grpc.LogsServiceServicer):
     def Export(self, request, context):
-        logger.info("📥 Log ricevuto")
+        logger.info(f"Received Export request with {len(request.resource_logs)} ResourceLogs")
 
+        # Itera ResourceLogs
         for resource_log in request.resource_logs:
-            resource_attrs = {
-                attr.key: attr.value.string_value
-                for attr in resource_log.resource.attributes
-                if attr.value.WhichOneof("value") == "string_value"
-            }
+            # Recupera il valore del resource attribute 'cloudwatch_log_group_name'
+            cloudwatch_name = None
+            for attr in resource_log.resource.attributes:
+                if attr.key == "cloudwatch_log_group_name":
+                    cloudwatch_name = attr.value.string_value
+                    break
 
-            log_group = resource_attrs.get("cloudwatch_log_group_name")
-            logger.info(f"🔍 log_group: {log_group}")
+            logger.info(f"cloudwatch_log_group_name: {cloudwatch_name}")
 
-            if not log_group:
-                logger.warning("⚠️ Nessun cloudwatch_log_group_name nei resource attributes")
+            if not cloudwatch_name:
+                logger.info("Nessun cloudwatch_log_group_name trovato, skip enrichment per questo ResourceLog")
                 continue
 
-            enrichment = enrichment_cache.get(log_group)
-            if not enrichment:
-                logger.warning(f"❌ Nessun enrichment trovato per {log_group}")
+            # Cerca matching nel JSON (targets list)
+            matched_labels = None
+            for rule in ENRICHMENTS:
+                targets = rule.get("targets", [])
+                if cloudwatch_name in targets:
+                    matched_labels = rule.get("labels", {})
+                    logger.info(f"Match trovato per {cloudwatch_name}, labels: {matched_labels}")
+                    break
+
+            if not matched_labels:
+                logger.info(f"Nessun matching labels trovato per {cloudwatch_name}")
                 continue
 
-            logger.info(f"✅ Enrichment trovato: {enrichment}")
-
-            # Aggiungi i campi arricchiti ai resource attributes
-            for k, v in enrichment.items():
-                if k == "targets":
-                    continue
-                resource_log.resource.attributes.append(
-                    common_pb2.KeyValue(
+            # Aggiungi le labels al resource.attributes (senza duplicati)
+            existing_keys = {attr.key for attr in resource_log.resource.attributes}
+            for k, v in matched_labels.items():
+                if k not in existing_keys:
+                    attr = resource_pb2.KeyValue(
                         key=k,
-                        value=common_pb2.AnyValue(string_value=v)
+                        value=resource_pb2.AnyValue(string_value=str(v))
                     )
-                )
+                    resource_log.resource.attributes.append(attr)
+                    logger.debug(f"Aggiunta label {k}: {v}")
 
-        # Inoltro a Alloy su 4317
+        # Inoltra il request arricchito ad Alloy OTLP endpoint
         try:
-            with grpc.insecure_channel("localhost:4317") as channel:
-                stub = logs_service_pb2_grpc.LogsServiceStub(channel)
-                stub.Export(request)
-                logger.info("🚀 Log arricchiti inoltrati ad Alloy")
+            # exporter.export prende ExportLogsServiceRequest
+            result = exporter.export(request)
+            logger.info("Inoltro a Alloy OTLP riuscito")
         except Exception as e:
-            logger.error(f"❌ Errore invio a Alloy: {e}")
+            logger.error(f"Errore invio a Alloy: {e}")
 
-        return logs_service_pb2.ExportLogsServiceResponse()
-
+        return ExportLogsServiceResponse()
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    logs_service_pb2_grpc.add_LogsServiceServicer_to_server(EnricherService(), server)
+    logs_service_pb2_grpc.add_LogsServiceServicer_to_server(LogEnricherServicer(), server)
     server.add_insecure_port("[::]:50051")
-    logger.info("🚀 Enricher gRPC Server in ascolto su :50051")
     server.start()
+    logger.info("Server gRPC Log Enricher in ascolto sulla porta 50051")
     server.wait_for_termination()
-
 
 if __name__ == "__main__":
     serve()

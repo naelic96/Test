@@ -1,90 +1,98 @@
-import grpc
+
 import json
 import logging
+import grpc
 from concurrent import futures
+import time
 
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc, logs_service_pb2
 from opentelemetry.proto.logs.v1 import logs_pb2
-from opentelemetry.proto.resource.v1 import resource_pb2
+from opentelemetry.exporter.otlp.proto.grpc.logs_exporter import OTLPLogExporter
+from opentelemetry.proto.common.v1 import common_pb2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enricher")
 
 class LogEnricherServicer(logs_service_pb2_grpc.LogsServiceServicer):
-    def __init__(self, enrich_config_file, label_keys_to_promote, alloy_target):
-        self.enrich_config_file = enrich_config_file
-        self.label_keys_to_promote = label_keys_to_promote
-        self.alloy_target = alloy_target
-        self.load_enrichments()
+    def __init__(self, enrich_file_path, labels_to_promote=None):
+        self.enrich_file_path = enrich_file_path
+        self.enrich_data = self.load_enrich_file()
+        self.labels_to_promote = labels_to_promote or []  # labels da promuovere in labels Loki
+        self.exporter = OTLPLogExporter(endpoint="localhost:4317", insecure=True)
 
-        # Setup channel & stub for forwarding to Alloy
-        self.channel = grpc.insecure_channel(self.alloy_target)
-        self.stub = logs_service_pb2_grpc.LogsServiceStub(self.channel)
-
-    def load_enrichments(self):
+    def load_enrich_file(self):
         try:
-            with open(self.enrich_config_file, "r") as f:
-                self.enrich_data = json.load(f)
-                logger.info(f"Enrichment config loaded from {self.enrich_config_file}")
+            with open(self.enrich_file_path, "r") as f:
+                data = json.load(f)
+                logger.info(f"Enrich file loaded: {self.enrich_file_path}")
+                return data
         except Exception as e:
             logger.error(f"Errore durante il caricamento del file JSON: {e}")
-            self.enrich_data = []
-
-    def find_labels(self, log_group_name):
-        for entry in self.enrich_data:
-            targets = entry.get("Targets", [])
-            if log_group_name in targets:
-                return entry.get("Labels", {})
-        return {}
+            return []
 
     def Export(self, request, context):
-        logger.info(f"Ricevuto Export con {len(request.resource_logs)} resource_logs")
-
-        enriched_resource_logs = []
+        logger.info(f"Ricevuti {len(request.resource_logs)} resource_logs")
 
         for resource_log in request.resource_logs:
-            resource = resource_log.resource
+            # Estraggo cloudwatch_log_group_name da resource attributes
             log_group_name = None
-            for attr in resource.attributes:
+            for attr in resource_log.resource.attributes:
                 if attr.key == "cloudwatch_log_group_name":
                     log_group_name = attr.value.string_value
                     break
+            logger.info(f"Resource cloudwatch_log_group_name: {log_group_name}")
 
-            labels_to_add = {}
-            if log_group_name:
-                labels_to_add = self.find_labels(log_group_name)
-                logger.info(f"Enriching logs per log_group_name='{log_group_name}': {labels_to_add}")
+            if not log_group_name:
+                logger.warning("Nessun cloudwatch_log_group_name trovato nel resource attributes, salto")
+                continue
 
-            new_attributes = list(resource.attributes)
+            # Cerco matching nei targets caricati da JSON
+            matching_entry = None
+            for entry in self.enrich_data:
+                targets = entry.get("Targets", [])
+                if log_group_name in targets:
+                    matching_entry = entry
+                    break
 
-            for k, v in labels_to_add.items():
-                if k in self.label_keys_to_promote:
-                    new_attributes.append(resource_pb2.KeyValue(
-                        key=f"label_{k}",
-                        value=resource_pb2.AnyValue(string_value=str(v))
-                    ))
-                else:
-                    new_attributes.append(resource_pb2.KeyValue(
-                        key=k,
-                        value=resource_pb2.AnyValue(string_value=str(v))
-                    ))
+            if not matching_entry:
+                logger.info(f"Nessun matching trovato per log_group_name: {log_group_name}")
+                continue
 
-            new_resource = resource_pb2.Resource(attributes=new_attributes)
+            logger.info(f"Matching trovato per log_group_name: {log_group_name}, labels da aggiungere: {matching_entry.get('Labels',{})}")
 
-            enriched_resource_log = logs_pb2.ResourceLogs(
-                resource=new_resource,
-                scope_logs=resource_log.scope_logs,
-            )
-            enriched_resource_logs.append(enriched_resource_log)
+            # Per ogni log record, arricchisco le labels e preparo la nuova struttura
+            for scope_log in resource_log.scope_logs:
+                for log_record in scope_log.logs:
+                    # Stampo il corpo log per debug
+                    logger.info(f"Log body prima enrich: {log_record.body}")
 
-        enriched_request = logs_service_pb2.ExportLogsServiceRequest(
-            resource_logs=enriched_resource_logs
-        )
+                    # Aggiungo labels come attributi (labels per Loki sono resource attributes o attributes)
+                    # Promuovo solo quelli in labels_to_promote come labels vere, gli altri come attributi normali
+                    new_attributes = list(log_record.attributes)
 
+                    # Trasformo Labels da matching_entry in attributi e labels selezionate in separate
+                    # In OpenTelemetry logs le "labels" sono generalmente resource attributes o log attributes
+                    # Qui aggiungiamo come attributi (key-value)
+                    for k, v in matching_entry.get("Labels", {}).items():
+                        # Se la label è da promuovere, aggiungo prefisso "loki_label_" per distinguerle (o altra logica)
+                        if k in self.labels_to_promote:
+                            # Se vuoi puoi usare un attributo speciale o lasciare così (dipende da ingest su Loki)
+                            new_attributes.append(common_pb2.KeyValue(key=k, value=common_pb2.AnyValue(string_value=v)))
+                        else:
+                            # Campi normali come attributi
+                            new_attributes.append(common_pb2.KeyValue(key=k, value=common_pb2.AnyValue(string_value=v)))
+
+                    # Sovrascrivo gli attributi del log_record
+                    log_record.attributes[:] = new_attributes
+
+                    # Stampo il corpo arricchito per debug
+                    logger.info(f"Log body dopo enrich: {log_record.body}")
+                    logger.info(f"Attributi arricchiti: {[f'{a.key}={a.value.string_value}' for a in log_record.attributes]}")
+
+        # Inoltro tutto a Alloy OTLP (localhost:4317)
         try:
-            # Forward enriched logs to Alloy
-            resp = self.stub.Export(enriched_request)
-            logger.info("Inoltro a Alloy avvenuto con successo")
+            self.exporter.export(request)
+            logger.info("Log arricchiti inviati a Alloy con successo")
         except Exception as e:
             logger.error(f"Errore invio a Alloy: {e}")
 
@@ -92,17 +100,18 @@ class LogEnricherServicer(logs_service_pb2_grpc.LogsServiceServicer):
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    enrich_config_file = "/tmp/enriched_tags.json"
-    label_keys_to_promote = ["aws_region", "global_app"]
-    alloy_target = "localhost:4317"  # Cambia se Alloy è altrove
-
     logs_service_pb2_grpc.add_LogsServiceServicer_to_server(
-        LogEnricherServicer(enrich_config_file, label_keys_to_promote, alloy_target), server
+        LogEnricherServicer("/tmp/enriched_tags.json", labels_to_promote=["aws_region", "global_app"]),
+        server
     )
-    server.add_insecure_port('[::]:50051')
-    logger.info("Starting gRPC server on port 50051...")
+    server.add_insecure_port("[::]:50051")
+    logger.info("Server grpc LogEnricher in ascolto sulla porta 50051...")
     server.start()
-    server.wait_for_termination()
+    try:
+        while True:
+            time.sleep(60*60*24)
+    except KeyboardInterrupt:
+        server.stop(0)
 
 if __name__ == "__main__":
     serve()

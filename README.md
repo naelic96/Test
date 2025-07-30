@@ -7,91 +7,100 @@ from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc, logs_se
 from opentelemetry.proto.logs.v1 import logs_pb2
 from opentelemetry.proto.resource.v1 import resource_pb2
 
-from opentelemetry.exporter.otlp.proto.grpc.logs_exporter import OTLPLogExporter
-from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceResponse
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enricher")
 
-JSON_PATH = "/tmp/enriched_tags.json"
-ALLOY_OTLP_ENDPOINT = "localhost:4317"
-
-# Carica JSON arricchimenti una volta all'avvio
-def load_enrichments():
-    try:
-        with open(JSON_PATH, "r") as f:
-            data = json.load(f)
-            # data è lista di dict con 'targets' (lista) e 'labels' (dict)
-            logger.info(f"Loaded enrichment rules from {JSON_PATH}")
-            return data
-    except Exception as e:
-        logger.error(f"Errore caricamento file JSON: {e}")
-        return []
-
-ENRICHMENTS = load_enrichments()
-
-# Exporter OTLP verso Alloy
-exporter = OTLPLogExporter(endpoint=ALLOY_OTLP_ENDPOINT, insecure=True)
-
 class LogEnricherServicer(logs_service_pb2_grpc.LogsServiceServicer):
+    def __init__(self, enrich_config_file, label_keys_to_promote):
+        self.enrich_config_file = enrich_config_file
+        self.label_keys_to_promote = label_keys_to_promote
+        self.load_enrichments()
+
+    def load_enrichments(self):
+        try:
+            with open(self.enrich_config_file, "r") as f:
+                # Assume JSON is a list of dicts with keys: Targets (list) and Labels (dict)
+                self.enrich_data = json.load(f)
+                logger.info(f"Enrichment config loaded from {self.enrich_config_file}")
+        except Exception as e:
+            logger.error(f"Errore durante il caricamento del file JSON: {e}")
+            self.enrich_data = []
+
+    def find_labels(self, log_group_name):
+        # Cerca la corrispondenza precisa in Targets e ritorna le labels
+        for entry in self.enrich_data:
+            targets = entry.get("Targets", [])
+            if log_group_name in targets:
+                return entry.get("Labels", {})
+        return {}
+
     def Export(self, request, context):
-        logger.info(f"Received Export request with {len(request.resource_logs)} ResourceLogs")
+        # Log di debug in ingresso
+        logger.info(f"Received Export request with {len(request.resource_logs)} resource_logs")
 
-        # Itera ResourceLogs
+        enriched_resource_logs = []
+
         for resource_log in request.resource_logs:
-            # Recupera il valore del resource attribute 'cloudwatch_log_group_name'
-            cloudwatch_name = None
-            for attr in resource_log.resource.attributes:
+            resource = resource_log.resource
+            # Estraggo log_group_name da resource attributes
+            log_group_name = None
+            for attr in resource.attributes:
                 if attr.key == "cloudwatch_log_group_name":
-                    cloudwatch_name = attr.value.string_value
+                    log_group_name = attr.value.string_value
                     break
 
-            logger.info(f"cloudwatch_log_group_name: {cloudwatch_name}")
+            labels_to_add = {}
+            if log_group_name:
+                labels_to_add = self.find_labels(log_group_name)
+                logger.info(f"Enriching logs with labels for log_group_name='{log_group_name}': {labels_to_add}")
 
-            if not cloudwatch_name:
-                logger.info("Nessun cloudwatch_log_group_name trovato, skip enrichment per questo ResourceLog")
-                continue
+            # Ricostruisco i resource logs arricchiti
+            # Promuovo solo le chiavi specificate a labels (Loki labels)
+            new_attributes = list(resource.attributes)
 
-            # Cerca matching nel JSON (targets list)
-            matched_labels = None
-            for rule in ENRICHMENTS:
-                targets = rule.get("targets", [])
-                if cloudwatch_name in targets:
-                    matched_labels = rule.get("labels", {})
-                    logger.info(f"Match trovato per {cloudwatch_name}, labels: {matched_labels}")
-                    break
-
-            if not matched_labels:
-                logger.info(f"Nessun matching labels trovato per {cloudwatch_name}")
-                continue
-
-            # Aggiungi le labels al resource.attributes (senza duplicati)
-            existing_keys = {attr.key for attr in resource_log.resource.attributes}
-            for k, v in matched_labels.items():
-                if k not in existing_keys:
-                    attr = resource_pb2.KeyValue(
+            # Aggiungo tutti come attributes (fields)
+            for k, v in labels_to_add.items():
+                # Promuovi solo se in label_keys_to_promote, altrimenti solo fields (attributes)
+                if k in self.label_keys_to_promote:
+                    # Se vuoi trattarli come labels, aggiungili con prefisso speciale o logica apposita
+                    # Per ora li aggiungiamo come resource attributes con prefisso "label_"
+                    new_attributes.append(resource_pb2.KeyValue(
+                        key=f"label_{k}",
+                        value=resource_pb2.AnyValue(string_value=str(v))
+                    ))
+                else:
+                    new_attributes.append(resource_pb2.KeyValue(
                         key=k,
                         value=resource_pb2.AnyValue(string_value=str(v))
-                    )
-                    resource_log.resource.attributes.append(attr)
-                    logger.debug(f"Aggiunta label {k}: {v}")
+                    ))
 
-        # Inoltra il request arricchito ad Alloy OTLP endpoint
-        try:
-            # exporter.export prende ExportLogsServiceRequest
-            result = exporter.export(request)
-            logger.info("Inoltro a Alloy OTLP riuscito")
-        except Exception as e:
-            logger.error(f"Errore invio a Alloy: {e}")
+            new_resource = resource_pb2.Resource(attributes=new_attributes)
 
-        return ExportLogsServiceResponse()
+            # Ricostruisco il resource_log con risorse arricchite
+            enriched_resource_log = logs_pb2.ResourceLogs(
+                resource=new_resource,
+                scope_logs=resource_log.scope_logs,
+            )
+            enriched_resource_logs.append(enriched_resource_log)
+
+        response = logs_service_pb2.ExportLogsServiceResponse()
+        # Non modifico i logs di risposta, solo li inoltro così come arricchiti
+
+        # TODO: aggiungere inoltro a Alloy sulla porta 4317 (gRPC)
+
+        return response
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    logs_service_pb2_grpc.add_LogsServiceServicer_to_server(LogEnricherServicer(), server)
-    server.add_insecure_port("[::]:50051")
+    enrich_config_file = "/tmp/enriched_tags.json"
+    label_keys_to_promote = ["aws_region", "global_app"]
+
+    logs_service_pb2_grpc.add_LogsServiceServicer_to_server(
+        LogEnricherServicer(enrich_config_file, label_keys_to_promote), server
+    )
+    server.add_insecure_port('[::]:50051')
+    logger.info("Starting gRPC server on port 50051...")
     server.start()
-    logger.info("Server gRPC Log Enricher in ascolto sulla porta 50051")
     server.wait_for_termination()
 
 if __name__ == "__main__":

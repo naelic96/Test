@@ -5,98 +5,100 @@ import json
 import time
 
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc, logs_service_pb2
-from opentelemetry.proto.logs.v1 import logs_pb2
 from opentelemetry.proto.common.v1 import common_pb2
-from opentelemetry.proto.resource.v1 import resource_pb2
-from opentelemetry.exporter.otlp.proto.grpc.exporter import OTLPLogExporter
+from opentelemetry.proto.logs.v1 import logs_pb2
 
+# Configurazione del logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enricher")
 
-# Solo questi verranno promossi a resource attributes (label per Loki)
 ENRICH_KEYS_AS_LABELS = {"aws_region", "global_app"}
 
-class OTLPLogExporterWrapper:
+# Classe custom per il client gRPC che invia i log arricchiti
+class OTLPLogExporterCustom:
     def __init__(self, endpoint):
-        self.exporter = OTLPLogExporter(endpoint=endpoint, insecure=True)
+        self.channel = grpc.insecure_channel(endpoint)
+        self.stub = logs_service_pb2_grpc.LogsServiceStub(self.channel)
 
     def export(self, logs_data):
-        return self.exporter.export(logs_data)
+        try:
+            response = self.stub.Export(logs_data)
+            logger.info("Logs forwarded successfully to Alloy")
+            return response
+        except grpc.RpcError as e:
+            logger.error(f"Error forwarding logs: {e}")
+            return None
 
+# Classe del servizio gRPC che arricchisce e inoltra i log
 class EnrichServicer(logs_service_pb2_grpc.LogsServiceServicer):
     def __init__(self, enrich_path):
         self.enrich_path = enrich_path
         self.enrich_data = self.load_enrich_file()
-        self.exporter = OTLPLogExporterWrapper("localhost:4317")
-        logger.info(f"Loaded enrich data for {len(self.enrich_data)} targets.")
+        self.exporter = OTLPLogExporterCustom("localhost:4317")
+        logger.info(f"Loaded enrich data for targets: {list(self.enrich_data.keys())}")
 
     def load_enrich_file(self):
         try:
             with open(self.enrich_path, "r") as f:
-                raw = json.load(f)
-
-            enrich_map = {}
-            for entry in raw:
-                targets = entry.get("Targets", [])
-                labels = entry.get("labels", {})
-                for target in targets:
-                    enrich_map[target] = labels
-            return enrich_map
+                data = json.load(f)
+            return data
         except Exception as e:
-            logger.error(f"Errore nel caricamento del file JSON: {e}")
+            logger.error(f"Error loading enrich file: {e}")
             return {}
 
     def Export(self, request, context):
-        logger.info(f"📦 Ricevuti {len(request.resource_logs)} resource_logs")
+        logger.info(f"Received Export request with {len(request.resource_logs)} resource_logs")
 
+        # Itera sui log ricevuti
         for resource_log in request.resource_logs:
-            log_group_name = None
             resource_attrs = resource_log.resource.attributes
 
-            for attr in resource_attrs:
-                if attr.key == "cloudwatch_log_group_name":
-                    log_group_name = attr.value.string_value
+            log_group_name = None
+            for k, v in resource_attrs.items():
+                if k == "cloudwatch_log_group_name":
+                    log_group_name = v.string_value
                     break
 
-            logger.info(f"🔍 Trovato log_group_name: {log_group_name}")
+            logger.info(f"log_group_name: {log_group_name}")
 
+            # Se non esiste un log_group_name valido, salta
             if not log_group_name or log_group_name not in self.enrich_data:
                 continue
 
-            enrich_tags = self.enrich_data[log_group_name]
-            logger.info(f"✨ Enrichment: {enrich_tags}")
+            enrich_labels = self.enrich_data[log_group_name]
+            logger.info(f"Enriching logs for {log_group_name} with {enrich_labels}")
 
+            # Arricchisci i log
             for scope_log in resource_log.scope_logs:
-                for log_record in scope_log.log_records:
-                    # Aggiunge tutti gli enrich come attributi del log
-                    for key, value in enrich_tags.items():
-                        log_record.attributes.append(
-                            common_pb2.KeyValue(key=key, value=common_pb2.AnyValue(string_value=value))
-                        )
+                for log_record in scope_log.logs:
+                    # Promuovi alcuni campi come label, altri restano come attributi
+                    for key, val in enrich_labels.items():
+                        if key in ENRICH_KEYS_AS_LABELS:
+                            # Aggiungi come label
+                            log_record.labels[key] = val
+                        else:
+                            # Aggiungi come attributo
+                            log_record.attributes[key].CopyFrom(common_pb2.AnyValue(string_value=val))
 
-            # Promuove solo alcune chiavi a resource attributes (diventano label in Loki)
-            for key, value in enrich_tags.items():
-                if key in ENRICH_KEYS_AS_LABELS:
-                    resource_attrs.append(
-                        common_pb2.KeyValue(key=key, value=common_pb2.AnyValue(string_value=value))
-                    )
-
+        # Inoltra i log arricchiti a Alloy tramite gRPC
         try:
             self.exporter.export(request)
-            logger.info("✅ Logs inoltrati a Alloy su localhost:4317")
+            logger.info("Forwarded enriched logs to Alloy")
         except Exception as e:
-            logger.error(f"❌ Errore invio a Alloy: {e}")
+            logger.error(f"Error forwarding logs: {e}")
 
         return logs_service_pb2.ExportLogsServiceResponse()
 
+# Funzione che avvia il server gRPC
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     logs_service_pb2_grpc.add_LogsServiceServicer_to_server(
-        EnrichServicer("/tmp/enriched_tags.json"), server
+        EnrichServicer("/tmp/enriched_tags.json"),
+        server
     )
     server.add_insecure_port("[::]:50051")
     server.start()
-    logger.info("🚀 Enricher gRPC server avviato su porta 50051")
+    logger.info("gRPC Enricher Server started on port 50051")
     try:
         while True:
             time.sleep(3600)

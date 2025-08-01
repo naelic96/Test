@@ -1,15 +1,24 @@
-line 12: field max_outstanding_per_tenant not found in type distributor.Config
-line 22: field max_chunk_size_bytes not found in type ingester.Config
-line 23: field max_chunks_per_query not found in type ingester.Config
-line 24: field max_chunk_series_limit not found in type ingester.Config
-line 25: field max_transfer_retries not found in type ingester.Config
-line 46: cannot unmarshal !!map into string
-line 51: field enforce_metric_name not found in type validation.plain
-line 52: field max_entries_limit not found in type validation.plain
-line 54: field max_label_names_per_stream not found in type validation.plain
-line 55: field max_labels_per_series not found in type validation.plain
-line 60: field max_chunk_series_limit not found in type validation.plain
-line 65: field split_queries_by_interval not found in type queryrange.Config
-line 67: field max_query_parallelism not found in type queryrange.Config
-line 81: field receivers not found in type loki.ConfigWrapper
-line 90: field labels_config not found in type loki.ConfigWrapper
+line 19: field max_chunk_size_bytes not found in type ingester.Config
+  line 20: field max_chunks_per_query not found in type ingester.Config
+  line 21: field max_chunk_series_limit not found in type ingester.Config
+  line 22: field max_transfer_retries not found in type ingester.Config
+  line 23: field max_transfer_retries_period not found in type ingester.Config
+  line 26: field tsdb not found in type storage.Config
+  line 45: field shared_store not found in type compactor.Config
+  line 61: field enforce_metric_name not found in type validation.plain
+  line 63: field max_entries_per_stream not found in type validation.plain
+  line 64: field max_entries_limit not found in type validation.plain
+  line 65: field max_label_names_per_stream not found in type validation.plain
+  line 66: field max_labels_per_series not found in type validation.plain
+  line 67: field max_chunk_series_limit not found in type validation.plain
+  line 68: field max_chunk_age not found in type validation.plain
+  line 73: field max_bytes_per_query not found in type validation.plain
+  line 74: field max_bytes_per_write not found in type validation.plain
+  line 75: field ingestion_burst_size not found in type validation.plain
+  line 78: field max_outstanding_write_requests not found in type validation.plain
+  line 82: field split_queries_by_interval not found in type queryrange.Config
+  line 88: field tail_proxy_connect_timeout not found in type lokifrontend.Config
+  line 89: field tail_proxy_idle_timeout not found in type lokifrontend.Config
+  line 91: field ruler already set in type loki.ConfigWrapper
+  line 98: field storage not found in type loki.ConfigWrapper
+  line 103: field max_look_back_period not found in type config.ChunkStoreConfig

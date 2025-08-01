@@ -1,16 +1,59 @@
-line 10: field max_recv_msg_size_bytes not found in type distributor.Config
-line 11: field max_outstanding_per_tenant not found in type distributor.Config
-line 23: field max_transfer_retries not found in type ingester.Config
-line 24: field max_chunk_series_limit not found in type ingester.Config
-line 25: field max_chunks_per_query not found in type ingester.Config
-line 31: field shared_store not found in type boltdb.IndexCfg
-line 36: field enforce_metric_name not found in type validation.plain
-line 40: field max_entries_limit not found in type validation.plain
-line 43: field max_streams_per_query not found in type validation.plain
-line 44: field max_labels_per_series not found in type validation.plain
-line 49: field split_queries_by_interval not found in type queryrange.Config
-line 54: field enable_fifocache not found in type queryrangebase.ResultsCacheConfig
-line 55: field fifocache not found in type queryrangebase.ResultsCacheConfig
-line 60: field labels_config not found in type loki.ConfigWrapper
-line 65: field otelcol not found in type loki.ConfigWrapper
-line 85: field server already set in type loki.ConfigWrapper
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  log_level: info
+
+distributor:
+  ring:
+    kvstore:
+      store: inmemory
+
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+    final_sleep: 0s
+  chunk_idle_period: 10m
+  max_chunk_age: 1h
+  chunk_target_size: 1048576  # 1MB
+
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+    shared_store: filesystem
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  max_streams_per_user: 50000
+  max_query_lookback: 720h   # 30 giorni
+  max_query_length: 24h
+  max_label_name_length: 256
+  max_label_value_length: 1024
+
+query_range:
+  align_queries_with_step: true
+  max_retries: 5
+  split_queries_by_interval: 1h
+
+ruler:
+  enable_api: true
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  alertmanager_url: http://alertmanager:9093
+
+ingester_client:
+  grpc_client_config:
+    max_send_msg_size: 10485760  # 10MB
+
+# Configurazione per promuovere o scartare label si fa con:
+# relabel_configs (se usi pipeline o config di scrape lato collector/alloy)
+# Loki 3.5 NON supporta labels_config
+
+# Per OTLP ricezione, config esterna OTEL Collector/Alloy invia a Loki HTTP o gRPC endpoint standard

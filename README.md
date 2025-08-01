@@ -1,24 +1,20 @@
-line 19: field max_chunk_size_bytes not found in type ingester.Config
-  line 20: field max_chunks_per_query not found in type ingester.Config
-  line 21: field max_chunk_series_limit not found in type ingester.Config
-  line 22: field max_transfer_retries not found in type ingester.Config
-  line 23: field max_transfer_retries_period not found in type ingester.Config
-  line 26: field tsdb not found in type storage.Config
-  line 45: field shared_store not found in type compactor.Config
-  line 61: field enforce_metric_name not found in type validation.plain
-  line 63: field max_entries_per_stream not found in type validation.plain
-  line 64: field max_entries_limit not found in type validation.plain
-  line 65: field max_label_names_per_stream not found in type validation.plain
-  line 66: field max_labels_per_series not found in type validation.plain
-  line 67: field max_chunk_series_limit not found in type validation.plain
-  line 68: field max_chunk_age not found in type validation.plain
-  line 73: field max_bytes_per_query not found in type validation.plain
-  line 74: field max_bytes_per_write not found in type validation.plain
-  line 75: field ingestion_burst_size not found in type validation.plain
-  line 78: field max_outstanding_write_requests not found in type validation.plain
-  line 82: field split_queries_by_interval not found in type queryrange.Config
-  line 88: field tail_proxy_connect_timeout not found in type lokifrontend.Config
-  line 89: field tail_proxy_idle_timeout not found in type lokifrontend.Config
-  line 91: field ruler already set in type loki.ConfigWrapper
-  line 98: field storage not found in type loki.ConfigWrapper
-  line 103: field max_look_back_period not found in type config.ChunkStoreConfig
+level=error ts=2025-08-01T07:10:53.353382642Z caller=loki.go:597 msg="module failed" module=pattern-ring-client error="starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
+level=info ts=2025-08-01T07:10:53.353394627Z caller=basic_lifecycler.go:242 msg="ring lifecycler is shutting down" ring=compactor
+level=info ts=2025-08-01T07:10:53.353396041Z caller=manager.go:267 msg="stopping user managers"
+level=info ts=2025-08-01T07:10:53.353406061Z caller=manager.go:281 msg="all user managers stopped"
+level=error ts=2025-08-01T07:10:53.353402578Z caller=loki.go:597 msg="module failed" module=querier error="failed to start querier, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
+level=info ts=2025-08-01T07:10:53.353410897Z caller=mapper.go:47 msg="cleaning up mapped rules directory" path=/tmp/loki/rules
+level=error ts=2025-08-01T07:10:53.353414053Z caller=loki.go:597 msg="module failed" module=distributor error="failed to start distributor, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
+level=error ts=2025-08-01T07:10:53.353422356Z caller=loki.go:597 msg="module failed" module=pattern-ingester-tee error="failed to start pattern-ingester-tee, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
+level=error ts=2025-08-01T07:10:53.353429159Z caller=loki.go:597 msg="module failed" module=pattern-ingester error="failed to start pattern-ingester, because it depends on module pattern-ingester-tee, which has failed: context canceled"
+level=info ts=2025-08-01T07:10:53.353450262Z caller=module_service.go:120 msg="module stopped" module=ruler
+level=info ts=2025-08-01T07:10:53.353441768Z caller=ingester.go:771 component=ingester msg="sleeping for initial delay before starting periodic flushing" delay=1.17890091s
+level=info ts=2025-08-01T07:10:53.353458835Z caller=basic_lifecycler.go:407 msg="unregistering instance from ring" ring=compactor
+level=error ts=2025-08-01T07:10:53.35345594Z caller=lifecycler.go:619 component=ingester msg="failed to set state to LEAVING" ring=ingester err="Changing instance state from PENDING -> LEAVING is disallowed"
+level=info ts=2025-08-01T07:10:53.353467441Z caller=module_service.go:120 msg="module stopped" module=rule-evaluator
+level=info ts=2025-08-01T07:10:53.353468907Z caller=lifecycler.go:1058 component=ingester msg="transfers are disabled"
+level=info ts=2025-08-01T07:10:53.3534813Z caller=lifecycler.go:1075 component=ingester msg="lifecycler entering final sleep before shutdown" final_sleep=0s
+level=info ts=2025-08-01T07:10:53.353490025Z caller=module_service.go:120 msg="module stopped" module=ingester-querier
+level=info ts=2025-08-01T07:10:53.353511207Z caller=basic_lifecycler.go:282 msg="instance removed from the ring" ring=compactor
+level=error ts=2025-08-01T07:10:53.353537333Z caller=loki.go:597 msg="module failed" module=compactor error="starting module compactor: context canceled"
+level=error ts=2025-08-01T07:10:53.353567621Z caller=loki.go:597 msg="module failed" module=ingester error="starting module ingester: context canceled"

@@ -1,20 +1,190 @@
-level=error ts=2025-08-01T07:10:53.353382642Z caller=loki.go:597 msg="module failed" module=pattern-ring-client error="starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
-level=info ts=2025-08-01T07:10:53.353394627Z caller=basic_lifecycler.go:242 msg="ring lifecycler is shutting down" ring=compactor
-level=info ts=2025-08-01T07:10:53.353396041Z caller=manager.go:267 msg="stopping user managers"
-level=info ts=2025-08-01T07:10:53.353406061Z caller=manager.go:281 msg="all user managers stopped"
-level=error ts=2025-08-01T07:10:53.353402578Z caller=loki.go:597 msg="module failed" module=querier error="failed to start querier, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
-level=info ts=2025-08-01T07:10:53.353410897Z caller=mapper.go:47 msg="cleaning up mapped rules directory" path=/tmp/loki/rules
-level=error ts=2025-08-01T07:10:53.353414053Z caller=loki.go:597 msg="module failed" module=distributor error="failed to start distributor, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
-level=error ts=2025-08-01T07:10:53.353422356Z caller=loki.go:597 msg="module failed" module=pattern-ingester-tee error="failed to start pattern-ingester-tee, because it depends on module pattern-ring-client, which has failed: invalid service state: Failed, expected: Running, failure: starting module pattern-ring-client: invalid service state: Failed, expected: Running, failure: unable to initialise ring state: Get \"http://localhost:8500/v1/kv/collectors/pattern-ring?stale=\": dial tcp [::1]:8500: connect: connection refused"
-level=error ts=2025-08-01T07:10:53.353429159Z caller=loki.go:597 msg="module failed" module=pattern-ingester error="failed to start pattern-ingester, because it depends on module pattern-ingester-tee, which has failed: context canceled"
-level=info ts=2025-08-01T07:10:53.353450262Z caller=module_service.go:120 msg="module stopped" module=ruler
-level=info ts=2025-08-01T07:10:53.353441768Z caller=ingester.go:771 component=ingester msg="sleeping for initial delay before starting periodic flushing" delay=1.17890091s
-level=info ts=2025-08-01T07:10:53.353458835Z caller=basic_lifecycler.go:407 msg="unregistering instance from ring" ring=compactor
-level=error ts=2025-08-01T07:10:53.35345594Z caller=lifecycler.go:619 component=ingester msg="failed to set state to LEAVING" ring=ingester err="Changing instance state from PENDING -> LEAVING is disallowed"
-level=info ts=2025-08-01T07:10:53.353467441Z caller=module_service.go:120 msg="module stopped" module=rule-evaluator
-level=info ts=2025-08-01T07:10:53.353468907Z caller=lifecycler.go:1058 component=ingester msg="transfers are disabled"
-level=info ts=2025-08-01T07:10:53.3534813Z caller=lifecycler.go:1075 component=ingester msg="lifecycler entering final sleep before shutdown" final_sleep=0s
-level=info ts=2025-08-01T07:10:53.353490025Z caller=module_service.go:120 msg="module stopped" module=ingester-querier
-level=info ts=2025-08-01T07:10:53.353511207Z caller=basic_lifecycler.go:282 msg="instance removed from the ring" ring=compactor
-level=error ts=2025-08-01T07:10:53.353537333Z caller=loki.go:597 msg="module failed" module=compactor error="starting module compactor: context canceled"
-level=error ts=2025-08-01T07:10:53.353567621Z caller=loki.go:597 msg="module failed" module=ingester error="starting module ingester: context canceled"
+livedebugging {
+      enabled = true
+    }
+
+
+    prometheus.exporter.cloudwatch "ec2_metrics" {
+      sts_region = "eu-central-1"
+      aws_sdk_version_v2 = true
+      decoupled_scraping {
+        enabled = true
+      }
+      discovery {
+        type = "AWS/EC2"
+        regions = ["eu-central-1"]
+        metric {
+          name       = "CPUUtilization"
+          statistics = ["Average"]
+          period     = "5m"
+        }
+        metric {
+          name       = "NetworkPacketsIn"
+          statistics = ["Average"]
+          period     = "5m"
+        }
+      }
+    }
+
+    prometheus.scrape "scrape_metrics" {
+      targets         = prometheus.exporter.cloudwatch.ec2_metrics.targets
+      forward_to      = [prometheus.remote_write.prometheus_writer.receiver]
+      scrape_interval = "10s"
+    }
+
+    prometheus.remote_write "prometheus_writer" {
+      endpoint {
+        url = "http://prometheus.monitoring-preprod-axa-it.svc.cluster.local:9090/api/v1/write"
+        tls_config {
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+
+    otelcol.storage.file "rds_persistent_state" {
+      directory = "/var/lib/alloy/rds"
+    }
+
+    otelcol.storage.file "lambda_persistent_state" {
+      directory = "/var/lib/alloy/lambda"
+    }
+
+    otelcol.receiver.awscloudwatch "cloudwatch_logs_rds" {
+      region  = "eu-central-1"
+      storage = otelcol.storage.file.rds_persistent_state.handler
+      logs {
+        poll_interval = "1m"
+        max_events_per_request = 1000
+        groups {
+          autodiscover {
+            limit  = 100
+            prefix = "/aws/rds/"
+          }
+        }
+      }
+      output {
+        logs = [otelcol.processor.batch.aws_batch_before_grpc.input]
+        traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
+        metrics = [otelcol.processor.batch.batching_before_send.input]
+      }
+    }
+
+    otelcol.receiver.awscloudwatch "cloudwatch_logs_lambda" {
+      region  = "eu-central-1"
+      storage = otelcol.storage.file.lambda_persistent_state.handler
+      logs {
+        poll_interval = "1m"
+        max_events_per_request = 1000
+        start_from = "2025-08-01T01:00:00Z"
+        groups {
+          autodiscover {
+            limit  = 100
+            prefix = "/aws/lambda/"
+          }
+        }
+      }
+      output {
+        logs = [otelcol.processor.batch.aws_batch_before_grpc.input]
+        traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
+        metrics = [otelcol.processor.batch.batching_before_send.input]
+      }
+    }
+
+    otelcol.processor.batch "aws_batch_before_grpc" {
+      timeout = "10s"
+      send_batch_size = 500
+      output {
+        logs = [otelcol.exporter.otlp.to_python_grpc_server.input]
+      }
+    }
+
+    otelcol.exporter.otlp "to_python_grpc_server" {
+      client {
+        endpoint = "localhost:50051"
+        tls {
+          insecure = true
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+    otelcol.receiver.otlp "alloy_receiver" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+        max_recv_msg_size = "10000MiB"
+      }
+      output {
+        logs    = [otelcol.processor.transform.set_custom_tag_as_attributes.input]
+        traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
+        metrics = [otelcol.processor.batch.batching_before_send.input]
+      }
+    }
+
+
+    otelcol.connector.spanlogs "transform_trace_to_log" {
+      roots          = true
+      spans          = true
+      processes      = true
+      events         = true
+      span_attributes  = ["http.method", "http.target"]
+      event_attributes = ["log.severity", "log.message"]
+      output {
+        logs   = [otelcol.processor.transform.set_custom_tag_as_attributes.input]
+        traces = [otelcol.connector.servicegraph.default.input,otelcol.exporter.otlp.export_to_tempo.input] 
+      }
+    }
+
+    otelcol.processor.transform "set_custom_tag_as_attributes" {
+      error_mode = "ignore"
+      log_statements {
+        context = "log"
+        statements = [
+          `set(attributes["global_app"], attributes["global_app"])`,
+        ]
+      }
+      output {
+        logs = [otelcol.processor.batch.batching_before_send.input]
+      }
+    }
+
+    otelcol.processor.batch "batching_before_send" {
+      timeout = "10s"
+      send_batch_size = 1000
+      output {
+        logs    = [otelcol.exporter.otlphttp.export_to_loki.input]
+        metrics = [otelcol.exporter.prometheus.export_to_prometheus.input]
+        traces  = [otelcol.connector.servicegraph.default.input, otelcol.exporter.otlp.export_to_tempo.input] 
+      }
+    }
+
+    otelcol.connector.servicegraph "default" {
+      dimensions = ["http.method", "http.target"]
+      output {
+        metrics = [otelcol.exporter.prometheus.export_to_prometheus.input]
+      }
+    }
+
+    otelcol.exporter.otlphttp "export_to_loki" {
+      client {
+        endpoint = "http://loki.monitoring-preprod-axa-it.svc.cluster.local:3100/otlp"
+        tls {
+          insecure = true
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+    otelcol.exporter.otlp "export_to_tempo" {
+      client {
+        endpoint = "http://tempo.monitoring-preprod-axa-it.svc.cluster.local:4317"
+        tls {
+          insecure = true
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+
+    otelcol.exporter.prometheus "export_to_prometheus" {
+      forward_to = [prometheus.remote_write.prometheus_writer.receiver]
+    } 

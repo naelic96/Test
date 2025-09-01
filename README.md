@@ -1,193 +1,47 @@
-livedebugging {
-  enabled = true
-}
+def match_log_group_to_resource(log_group_name):
+    service = None
+    parts = log_group_name.strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "aws":
+        service = parts[1]
 
-prometheus.exporter.cloudwatch "ec2_metrics" {
-  sts_region = "eu-central-1"
-  aws_sdk_version_v2 = true
-  decoupled_scraping {
-    enabled = true
-  }
-  discovery {
-    type    = "AWS/EC2"
-    regions = ["eu-central-1"]
-    metric {
-      name       = "CPUUtilization"
-      statistics = ["Average"]
-      period     = "5m"
-    }
-    metric {
-      name       = "NetworkPacketsIn"
-      statistics = ["Average"]
-      period     = "5m"
-    }
-  }
-}
+    with lock:
+        matches = []
+        for arn, data in resource_cache.items():
+            arn_parts = arn.split(":")
+            resource_name = arn_parts[-1] if arn_parts else arn
+            resource_service = arn_parts[2] if len(arn_parts) > 2 else None
+            if log_group_name.endswith(resource_name) and (service is None or service == resource_service):
+                matches.append({"arn": arn, "tags": data.get("tags", {})})
 
-prometheus.scrape "scrape_metrics" {
-  targets         = prometheus.exporter.cloudwatch.ec2_metrics.targets
-  forward_to      = [prometheus.remote_write.prometheus_writer.receiver]
-  scrape_interval = "10s"
-}
+    if not matches:
+        logging.warning(f"Telemetria: {log_group_name} → Nessun match trovato")
+        return {}
 
-prometheus.remote_write "prometheus_writer" {
-  endpoint {
-    url = "http://prometheus.monitoring-preprod-axa-it.svc.cluster.local:9090/api/v1/write"
-    tls_config {
-      insecure_skip_verify = true
-    }
-  }
-}
+    if len(matches) > 1:
+        logging.info(f"Telemetria: {log_group_name} → Trovati {len(matches)} match multipli")
 
-otelcol.storage.file "rds_persistent_state" {
-  directory = "/var/lib/alloy/rds"
-}
+    enriched_tags = {}
+    seen_values = {}
 
-otelcol.storage.file "lambda_persistent_state" {
-  directory = "/var/lib/alloy/lambda"
-}
+    for idx, match in enumerate(matches):
+        base_tags = match["tags"].copy()
+        base_tags["resource_arn"] = match["arn"]
 
-otelcol.receiver.awscloudwatch "cloudwatch_logs_rds" {
-  region  = "eu-central-1"
-  storage = otelcol.storage.file.rds_persistent_state.handler
-  logs {
-    poll_interval = "1m"
-    max_events_per_request = 1000
-    groups {
-      autodiscover {
-        limit  = 100
-        prefix = "/aws/rds/"
-      }
-    }
-  }
-  output {
-    logs    = [otelcol.processor.batch.aws_batch_before_grpc.input]
-    traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
-    metrics = [otelcol.processor.batch.batching_before_send.input]
-  }
-}
+        for k, v in base_tags.items():
+            if k in ENRICH_KEYS_AS_LABELS:
+                enriched_tags[k] = v
+            else:
+                if k not in seen_values:
+                    enriched_tags[k] = v
+                    seen_values[k] = v
+                elif seen_values[k] != v:
+                    arn_parts = match["arn"].split(":")
+                    account_id = arn_parts[4] if len(arn_parts) > 4 else "unknown"
+                    resource_part = normalize_suffix(arn_parts[5] if len(arn_parts) > 5 else "")
+                    key = f"{resource_part}_{normalize_suffix(k)}"
+                    enriched_tags[key] = v
+                    enriched_tags[f"{resource_part}_account"] = account_id
+                    logging.info(f"Tag duplicato '{k}' con valori diversi, aggiunto suffisso '{key}'")
 
-otelcol.receiver.awscloudwatch "cloudwatch_logs_lambda" {
-  region  = "eu-central-1"
-  storage = otelcol.storage.file.lambda_persistent_state.handler
-  logs {
-    poll_interval = "1m"
-    max_events_per_request = 1000
-    start_from = "2025-08-01T01:00:00Z"
-    groups {
-      autodiscover {
-        limit  = 100
-        prefix = "/aws/lambda/"
-      }
-    }
-  }
-  output {
-    logs    = [otelcol.processor.batch.aws_batch_before_grpc.input]
-    traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
-    metrics = [otelcol.processor.batch.batching_before_send.input]
-  }
-}
-
-otelcol.processor.batch "aws_batch_before_grpc" {
-  timeout = "10s"
-  send_batch_size = 500
-  output {
-    logs = [otelcol.exporter.otlp.to_python_grpc_server.input]
-  }
-}
-
-otelcol.exporter.otlp "to_python_grpc_server" {
-  client {
-    endpoint = "localhost:50051"
-    tls {
-      insecure = true
-      insecure_skip_verify = true
-    }
-  }
-}
-
-otelcol.receiver.otlp "alloy_receiver" {
-  grpc {
-    endpoint = "0.0.0.0:4317"
-    max_recv_msg_size = "10000MiB"
-  }
-  output {
-    logs    = [otelcol.processor.transform.set_custom_tag_as_attributes.input]
-    traces  = [otelcol.connector.spanlogs.transform_trace_to_log.input, otelcol.processor.batch.batching_before_send.input]
-    metrics = [otelcol.processor.batch.batching_before_send.input]
-  }
-}
-
-otelcol.connector.spanlogs "transform_trace_to_log" {
-  roots           = true
-  spans           = true
-  processes       = true
-  events          = true
-  span_attributes = ["http.method", "http.target"]
-  event_attributes = ["log.severity", "log.message"]
-  output {
-    logs   = [otelcol.processor.transform.set_custom_tag_as_attributes.input]
-    traces = [otelcol.connector.servicegraph.default.input, otelcol.exporter.otlp.export_to_tempo.input]
-  }
-}
-
-otelcol.processor.transform "set_custom_tag_as_attributes" {
-  error_mode = "ignore"
-  log_statements {
-    context = "log"
-    statements = [
-      `set(attributes["global_app"], attributes["global_app"])`,
-    ]
-  }
-  output {
-    logs = [otelcol.processor.batch.batching_before_send.input]
-  }
-}
-
-otelcol.processor.batch "batching_before_send" {
-  timeout = "10s"
-  send_batch_size = 1000
-  output {
-    logs    = [otelcol.exporter.otlphttp.export_to_loki.input]
-    metrics = [otelcol.exporter.prometheus.export_to_prometheus.input]
-    traces  = [otelcol.connector.servicegraph.default.input, otelcol.exporter.otlp.export_to_tempo.input]
-  }
-}
-
-otelcol.connector.servicegraph "default" {
-  dimensions = ["http.method", "http.target"]
-  output {
-    metrics = [otelcol.exporter.prometheus.export_to_prometheus.input]
-  }
-}
-
-otelcol.connector.spanmetrics "spanmetrics_from_traces" {
-  dimensions = ["http.method", "http.target"]
-  output {
-    metrics = [otelcol.exporter.prometheus.export_to_prometheus.input]
-  }
-}
-
-otelcol.exporter.otlphttp "export_to_loki" {
-  client {
-    endpoint = "http://loki.monitoring-preprod-axa-it.svc.cluster.local:3100/otlp"
-    tls {
-      insecure = true
-      insecure_skip_verify = true
-    }
-  }
-}
-
-otelcol.exporter.otlp "export_to_tempo" {
-  client {
-    endpoint = "http://tempo.monitoring-preprod-axa-it.svc.cluster.local:4317"
-    tls {
-      insecure = true
-      insecure_skip_verify = true
-    }
-  }
-}
-
-otelcol.exporter.prometheus "export_to_prometheus" {
-  forward_to = [prometheus.remote_write.prometheus_writer.receiver]
-}
+    logging.info(f"Telemetria: {log_group_name} → tags arricchiti: {list(enriched_tags.keys())}")
+    return enriched_tags
